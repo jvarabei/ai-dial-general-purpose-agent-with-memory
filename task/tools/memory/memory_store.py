@@ -29,7 +29,10 @@ class LongTermMemoryStore:
         # 2. Create SentenceTransformer as model, model name is `all-MiniLM-L6-v2`
         # 3. Create cache, doct of str and MemoryCollection (it is imitation of cache, normally such cache should be set aside)
         # 4. Make `faiss.omp_set_num_threads(1)` (without this set up you won't be able to work in debug mode in `_deduplicate_fast` method
-        raise NotImplementedError()
+        self.endpoint = endpoint
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.cache: dict[str, MemoryCollection] = {}
+        faiss.omp_set_num_threads(1)
 
     async def _get_memory_file_path(self, dial_client: AsyncDial) -> str:
         """Get the path to the memory file in DIAL bucket."""
@@ -38,7 +41,8 @@ class LongTermMemoryStore:
         # 2. Return string with path in such format: `files/{bucket_with_app_home}/__long-memories/data.json`
         #    The memories will persist in appdata for this agent in `__long-memories` folder and `data.json` file
         #    (You will be able to check it also in Chat UI in attachments)
-        raise NotImplementedError()
+        app_home = await dial_client.my_appdata_home()
+        return f"files/{app_home}/__long-memories/data.json"
 
     async def _load_memories(self, api_key: str) -> MemoryCollection:
         #TODO:
@@ -59,7 +63,24 @@ class LongTermMemoryStore:
         #       - create MemoryCollection (it will have empty memories, set up time for updated_at, more detailed take
         #         a look at MemoryCollection pydentic model and it Fields)
         # 5. Return created MemoryCollection
-        raise NotImplementedError()
+        client = AsyncDial(base_url=self.endpoint, api_key=api_key, api_version="2025-01-01-preview")
+        memory_file_path = await self._get_memory_file_path(client)
+        if memory_file_path in self.cache:
+            print("Memories loaded from cache.")
+            return self.cache[memory_file_path]
+        
+        try:
+            print("Loading memories from DIAL bucket...")
+            file_content = await client.files.download(memory_file_path)
+            decoded_content = file_content.decode('utf-8')
+            memories_data = json.loads(decoded_content)
+            memory_collection = MemoryCollection.model_validate(memories_data)
+            print("Memories loaded from DIAL bucket.")
+        except Exception as e:
+            print(f"Failed to load memories from DIAL bucket: {e}. Initializing empty memory collection.")
+            memory_collection = MemoryCollection(memories=[], updated_at=datetime.now(UTC), last_deduplicated_at=None)
+
+        return memory_collection
 
     async def _save_memories(self, api_key: str, memories: MemoryCollection):
         """Save memories to DIAL bucket and update cache."""
@@ -73,7 +94,15 @@ class LongTermMemoryStore:
         #    1000 memories but anyway for 1000 memories it will be ~6-8Mb, so, we need to make at least these small
         #    efforts to make it smaller 😉
         # 5. Put to cache (kind reminder the key is memory file path)
-        raise NotImplementedError()
+        client = AsyncDial(base_url=self.endpoint, api_key=api_key, api_version="2025-01-01-preview")
+        memory_file_path = await self._get_memory_file_path(client)
+        memories.updated_at = datetime.now(UTC)
+        memories_json = memories.model_dump_json()
+        print("Saving memories to DIAL bucket...")
+        await client.files.upload(content=memories_json.encode('utf-8'), path=memory_file_path)
+        print("Saving memories to cache.")
+        self.cache[memory_file_path] = memories
+        
 
     async def add_memory(self, api_key: str, content: str, importance: float, category: str, topics: list[str]) -> str:
         """Add a new memory to storage."""
@@ -88,7 +117,20 @@ class LongTermMemoryStore:
         # 4. Add to memories created memory
         # 5. Save memories (it is PUT request bzw, -> https://dialx.ai/dial_api#tag/Files/operation/uploadFile)
         # 6. Return information that content has benn successfully stored
-        raise NotImplementedError()
+        memories = await self._load_memories(api_key)
+        embedding = self.model.encode([content])[0].tolist()
+        new_memory = Memory(
+            id=int(datetime.now(UTC).timestamp()),
+            content=content,
+            importance=importance,
+            category=category,
+            topics=topics,
+            embedding=embedding,
+        )
+        memories.memories.append(new_memory)
+        await self._save_memories(api_key, memories)
+        print("Memory added successfully.")
+        return "Memory successfully stored."
 
     async def search_memories(self, api_key: str, query: str, top_k: int = 5) -> list[MemoryData]:
         """
@@ -104,14 +146,44 @@ class LongTermMemoryStore:
         # 3. Check if they needs_deduplication, if yes then deduplicate_and_save (need to implements both of these methods)
         # 4. Make vector search (embeddings are part of memory)😈
         # 5. Return `top_k` MemoryData based on vector search
-        raise NotImplementedError()
+        memories = await self._load_memories(api_key)
+        if not memories.memories:
+            print("No memories to search.")
+            return []
+        
+        if self._needs_deduplication(memories):
+            print("Deduplication needed. Deduplicating memories...")
+            memories = await self._deduplicate_and_save(api_key, memories)
+            print("Deduplication completed.")
+        
+        embeddings = np.array([m.embedding for m in memories.memories]).astype('float32')
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        normalized_embeddings = embeddings / norms
+
+        index = faiss.IndexFlatIP(normalized_embeddings.shape[1])
+        index.add(normalized_embeddings)
+
+        query_embedding = self.model.encode([query]).astype('float32')
+        query_norm = np.linalg.norm(query_embedding, keepdims=True)
+        normalized_query = query_embedding / query_norm
+
+        k = min(top_k, len(memories.memories))
+        similarities, indices = index.search(normalized_query, k)
+
+        results = [memories.memories[i].data for i in indices[0]]
+
+        return results
 
     def _needs_deduplication(self, collection: MemoryCollection) -> bool:
         """Check if deduplication is needed (>24 hours since last deduplication)."""
         #TODO:
         # The criteria for deduplication (collection length > 10 and >24 hours since last deduplication) or
         # (collection length > 10 last deduplication is None)
-        raise NotImplementedError()
+        if len(collection.memories) <= 10:
+            return False
+        if collection.last_deduplicated_at is None:
+            return True
+        return (datetime.now(UTC) - collection.last_deduplicated_at) > timedelta(hours=24)
 
     async def _deduplicate_and_save(self, api_key: str, collection: MemoryCollection) -> MemoryCollection:
         """
@@ -123,7 +195,11 @@ class LongTermMemoryStore:
         # 2. Update last_deduplicated_at as now
         # 3. Save deduplicated memories
         # 4. Return deduplicated collection
-        raise NotImplementedError()
+        deduplicated_memories = self._deduplicate_fast(collection.memories)
+        collection.memories = deduplicated_memories
+        collection.last_deduplicated_at = datetime.now(UTC)
+        await self._save_memories(api_key, collection)
+        return collection
 
     def _deduplicate_fast(self, memories: list[Memory]) -> list[Memory]:
         """
@@ -140,7 +216,44 @@ class LongTermMemoryStore:
         # Among duplicates remember about `importance`, most important have more priorities to survive
         # It must be fast, it is possible to do for O(n log n), probably you can find faster way (share with community if do 😉)
         # Return deduplicated memories
-        raise NotImplementedError()
+
+        if len(memories) < 2:
+            return memories
+
+        embeddings = np.array([m.embedding for m in memories]).astype('float32')
+        n = len(embeddings)
+
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        normalized_embeddings = embeddings / norms
+
+        index = faiss.IndexFlatIP(normalized_embeddings.shape[1])
+        index.add(normalized_embeddings)
+
+        k = min(10, n)
+        similarities, indices = index.search(normalized_embeddings, k)
+
+        duplicates_to_remove = set()
+
+        for i in range(n):
+            if i in duplicates_to_remove:
+                continue
+
+            for j in range(1, k):
+                neighbor_idx = indices[i][j]
+
+                if neighbor_idx in duplicates_to_remove:
+                    continue
+
+                if similarities[i][j] > 0.75:
+                    if memories[i].data.importance >= memories[neighbor_idx].data.importance:
+                        duplicates_to_remove.add(neighbor_idx)
+                    else:
+                        duplicates_to_remove.add(i)
+                        break
+
+        deduplicated = [m for i, m in enumerate(memories) if i not in duplicates_to_remove]
+        return deduplicated
+        
 
     async def delete_all_memories(self, api_key: str, ) -> str:
         """
@@ -154,4 +267,16 @@ class LongTermMemoryStore:
         # 2. Get memory file path
         # 3. Delete file
         # 4. Return info about successful memory deletion
-        raise NotImplementedError()
+        client = AsyncDial(base_url=self.endpoint, api_key=api_key, api_version="2025-01-01-preview")
+        memory_file_path = await self._get_memory_file_path(client)
+        try:
+            await client.files.delete(memory_file_path)
+            print("Memory file deleted from DIAL bucket.")
+        except Exception as e:
+            print(f"Failed to delete memory file from DIAL bucket: {e}. It may not exist, but we will proceed to clear cache and return success message.")
+        
+        if memory_file_path in self.cache:
+            del self.cache[memory_file_path]
+            print("Memory cache cleared.")
+
+        return "All memories have been successfully deleted."

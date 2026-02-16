@@ -21,20 +21,37 @@ class SearchMemoryTool(BaseTool):
     @property
     def name(self) -> str:
         # TODO: provide self-descriptive name
-        raise NotImplementedError()
+        return "search_memory"
 
     @property
     def description(self) -> str:
         # TODO: provide tool description that will help LLM to understand when to use this tools and cover 'tricky'
         #  moments (not more 1024 chars)
-        raise NotImplementedError()
+        return "Searches long-term memories about the user. The tool takes a search query and returns relevant memories based on semantic similarity. " \
+        "Use this tool to find specific information about the user that may be stored in their long-term memory."
 
     @property
     def parameters(self) -> dict[str, Any]:
         # TODO: provide tool parameters JSON Schema:
         #  - query is string, description: "The search query. Can be a question or keywords to find relevant memories", required
         #  - top_k is integer, description: "Number of most relevant memories to return.", minimum is 1, maximum is 20, default is 5
-        raise NotImplementedError()
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query. Can be a question or keywords to find relevant memories.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Number of most relevant memories to return.",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        }
 
 
     async def _execute(self, tool_call_params: ToolCallParams) -> str:
@@ -47,4 +64,20 @@ class SearchMemoryTool(BaseTool):
         #    otherwise iterate through results and collect content, category and topics (if preset) in markdown format
         # 6. Add result to stage as markdown text
         # 7. Return result
-        raise NotImplementedError()
+        args = json.loads(tool_call_params.tool_call.function.arguments)
+        query = args["query"]
+        top_k = args.get("top_k", 5)
+        search_results: list[MemoryData] = await self.memory_store.search_memories(query=query, top_k=top_k)
+        if not search_results:
+            final_result = "No memories found."
+        else:
+            final_result = "Found the following relevant memories:\n\n"
+            for idx, memory in enumerate(search_results, start=1):
+                final_result += f"### Memory {idx}\n"
+                final_result += f"- **Content**: {memory.content}\n"
+                final_result += f"- **Category**: {memory.category}\n"
+                if memory.topics:
+                    final_result += f"- **Topics**: {', '.join(memory.topics)}\n"
+                final_result += "\n"
+        tool_call_params.stage.append_content(final_result)
+        return final_result
